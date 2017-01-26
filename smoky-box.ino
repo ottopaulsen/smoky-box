@@ -8,6 +8,7 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include <PID_v1.h>
 #include <FanController.h>
+#include <EEPROM.h>
 
 #include "secrets.h"
 /*
@@ -16,6 +17,9 @@
  *   #define MQTTPASSWORD "secret"
  *   #define UPDATEOTAPASSWORD "secret"
  */
+
+ #define SMOKY_ID "2"
+ #define PRODUCTION 0 // 1 to go Live, 0 to test
 
 unsigned long looptime = 0;
 
@@ -34,8 +38,8 @@ unsigned long mqttPreviousSentMillis = 0;
 PubSubClient mqttClient(wifiClient);
 
 // MQTT Topics
-#define MQTT_TOPIC_OUT "smoky/1"
-#define MQTT_TOPIC_IN "smoky/1/in"
+#define MQTT_TOPIC_OUT "smoky/" SMOKY_ID
+#define MQTT_TOPIC_IN "smoky/" SMOKY_ID "/in"
 const char* mqttTopicInsideTemperature = MQTT_TOPIC_OUT "/inside/temperature";
 const char* mqttTopicInsideHumidity = MQTT_TOPIC_OUT "/inside/humidity";
 const char* mqttTopicOutsideTemperature = MQTT_TOPIC_OUT "/outside/temperature";
@@ -71,13 +75,12 @@ const long ledInterval = 250;
 unsigned int mqttStatus = MQTT_STATUS_UNKNOWN;
 bool greenLed = false;
 unsigned long ledPreviousMillis = 0;
-bool readSettings = true;
 
 // Smoke
 #define SMOKEPIN A0
 
 // Serial
-const long serialWriteInterval = 1000;
+const long serialWriteInterval = 5000;
 unsigned long serialPreviousWriteMillis = 0;
 
 // Temperature and humidity
@@ -94,6 +97,24 @@ unsigned long dhtReadFailures = 0;
 unsigned long dhtReadInterval = 2000; 
 unsigned long dhtPreviousReadMillis = 0;
 
+// EEPROM Settings
+#define SETTINGS_VERSION 100
+#define DEFAULT_KP 5.0
+#define DEFAULT_KI 0.05
+#define DEFAULT_KD 0.5
+#define DEFAULT_TEMP 5.0
+#define DEFAULT_FAN 10
+struct SmokySettings {
+  int version; // Figure ot if data has been saved before
+  float Kp;
+  float Ki;
+  float Kd;
+  double temp;
+  int fan;
+};
+SmokySettings settings;
+
+
 // Heater control
 #define HEATERPIN 12
 //#define INITIALTEMPSETTING 5.0
@@ -103,10 +124,11 @@ float heaterOnPercent = 0.0;
 bool heaterOn = false;
 unsigned long heaterPreviousCalcMillis = 0;
 unsigned long heaterPreviousPidWindow = 0;
-double temperatureSetting =  5.0;
-float Kp =  5.0, Ki =  0.05, Kd =  0.5;
+//double temperatureSetting =  5.0;
+//float Kp =  5.0, Ki =  0.05, Kd =  0.5;
 double heaterOutput =  10.0;
-PID heaterPID(&temperatureInside, &heaterOutput, &temperatureSetting, Kp, Ki, Kd, DIRECT);
+PID heaterPID(&temperatureInside, &heaterOutput, &(settings.temp), settings.Kp, settings.Ki, settings.Kd, DIRECT);
+
 
 // Smoke
 float smoke = 0.0;
@@ -154,6 +176,14 @@ void setup() {
   dhtPreviousReadMillis = 0;
   loopReadTempHumid(); // Initial reading to get the temp controller a better start.
 
+  // MQTT
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  randomSeed(micros());
+  pinMode(GREENLED, OUTPUT);
+
+  delay(100);
+
   // Heater
   pinMode(HEATERPIN, OUTPUT);
   heaterPID.SetOutputLimits(0, maxHeaterOutput);
@@ -161,11 +191,9 @@ void setup() {
   heaterPreviousPidWindow = millis();
 
 
-  // MQTT
-  mqttClient.setServer(mqttServer, mqttPort);
-  mqttClient.setCallback(mqttCallback);
-  randomSeed(micros());
-  pinMode(GREENLED, OUTPUT);
+  EEPROM.begin(256);
+  readSettingsFromEEPROM();
+
 
   // OTA Update
   MDNS.begin("smoky");
@@ -180,15 +208,37 @@ void setup() {
   // Fan
   fan.begin();  
 
+  writeMqttSettings();
+
+}
+
+void readSettingsFromEEPROM(){
+  int eeAddress = 0;
+  mqttSend(mqttTopicOutMsg, String("Reading EEPROM").c_str());
+  EEPROM.get(eeAddress, settings);
+  
+  if(settings.version != SETTINGS_VERSION){
+    mqttSend(mqttTopicOutMsg, String("EEPROM - Not found version").c_str());
+    settings.version = SETTINGS_VERSION;
+    settings.Kp = DEFAULT_KP;
+    settings.Ki = DEFAULT_KI;
+    settings.Kd = DEFAULT_KD;
+    settings.temp = DEFAULT_TEMP;
+    settings.fan = DEFAULT_FAN;
+    EEPROM.put(0, settings);
+  }
+}
+
+void writeSettingsToEEPROM(){
+  int eeAddress = 0;
+  mqttSend(mqttTopicOutMsg, String("Writing EEPROM").c_str());
+  EEPROM.put(eeAddress, settings);
+  EEPROM.commit();
+  mqttSend(mqttTopicOutMsg, String(settings.temp).c_str());
 }
 
 void loop() {
   looptime = millis();
-  /* Currently there are many calls to the loopBlinkLed() method, which is controlling the 
-     blink frequency of the green LED, that is blinking while waiting for ack from Node-RED.
-     The reason is that it was blinking wit a variable frequency, probably because some
-     of these routines takes too long time. Not a big deal, so it could be called just once.
-  */
   loopBlinkLed();
   loopReadTempHumid();
   loopBlinkLed();
@@ -208,8 +258,6 @@ void loop() {
   httpServer.handleClient();
 }
 
-// Functions called in the loop (prefixed with loop)
-
 void loopReadTempHumid(){
   unsigned long currentMillis = millis();
   if (currentMillis - dhtPreviousReadMillis > dhtReadInterval) {
@@ -219,7 +267,7 @@ void loopReadTempHumid(){
       temperatureInside = prevTi;
       dhtReadFailures++;
       //Serial.println("DHT22 Read error");
-      mqttClient.publish(mqttTopicOutMsg, String("DHT22 Read error").c_str());
+      if(PRODUCTION) mqttSend(mqttTopicOutMsg, String("DHT22 Read error").c_str());
     }
     humidityInside = dhtInside.readHumidity();
     temperatureOutside = dhtOutside.readTemperature();
@@ -310,7 +358,6 @@ void loopBlinkLed(){
 
 void writeSerial(){
 
-  return; // Remove when needing this
 
   Serial.print("Fan setting: ");
   Serial.print(fanSetting);
@@ -319,6 +366,8 @@ void writeSerial(){
   Serial.print("   RPM: ");
   Serial.print(fanSpeedRPM);
   Serial.println("");
+
+  //return;
 
   Serial.print("Smoke level: ");
   Serial.print(smoke, 3);
@@ -347,6 +396,14 @@ void writeSerial(){
   Serial.print(heaterOnPercent, 1);
   Serial.print("");
 
+  Serial.print("    TempSetting %: ");
+  Serial.print(settings.temp, 1);
+  Serial.print("");
+
+  Serial.print("    FanSetting %: ");
+  Serial.print(settings.fan, 1);
+  Serial.print("");
+
   Serial.println("");
 }
 
@@ -364,20 +421,21 @@ void writeMqtt(){
   mqttClient.publish(mqttTopicHeaterOutput, (String(heaterOutput)).c_str());
   mqttClient.publish(mqttTopicDhtReadFailures, (String(dhtReadFailures)).c_str());
   mqttClient.publish(mqttTopicFanSpeed, (String(fanSpeedRPM)).c_str());
-  mqttClient.publish(mqttTopicFanSetting, (String(fanActualSetting)).c_str());
   heaterOnPercent = 0.0;
+}
 
+void writeMqttSettings(){
+  mqttStatus = MQTT_STATUS_SENDING;
+  reconnectMqtt();
+  Serial.println("Sending settings to MQTT");
 
-  if (readSettings){
-    mqttClient.publish(mqttTopicOutSettings, (String("temperatureSetting = ") + String(temperatureSetting)).c_str());
-    mqttClient.publish(mqttTopicOutSettings, (String("heaterOutput = ") + String(heaterOutput)).c_str());
-    mqttClient.publish(mqttTopicOutSettings, (String("Kp = ") + String(Kp)).c_str());
-    mqttClient.publish(mqttTopicOutSettings, (String("Ki = ") + String(Ki)).c_str());
-    mqttClient.publish(mqttTopicOutSettings, (String("Kd = ") + String(Kd)).c_str());
-    mqttClient.publish(mqttTopicOutSettings, (String("Fan = ") + String(fanSetting)).c_str());
-    readSettings = false;
-  }
-
+  mqttClient.publish(mqttTopicFanSetting, (String(fanActualSetting)).c_str());
+  mqttClient.publish(mqttTopicOutSettings, (String("temperatureSetting = ") + String(settings.temp)).c_str());
+  mqttClient.publish(mqttTopicOutSettings, (String("heaterOutput = ") + String(heaterOutput)).c_str());
+  mqttClient.publish(mqttTopicOutSettings, (String("Kp = ") + String(settings.Kp)).c_str());
+  mqttClient.publish(mqttTopicOutSettings, (String("Ki = ") + String(settings.Ki)).c_str());
+  mqttClient.publish(mqttTopicOutSettings, (String("Kd = ") + String(settings.Kd)).c_str());
+  mqttClient.publish(mqttTopicOutSettings, (String("Fan = ") + String(settings.fan)).c_str());
 }
 
 void reconnectMqtt() {
@@ -390,8 +448,8 @@ void reconnectMqtt() {
   if (!mqttClient.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Create a random client ID
-    String clientId = "smoky-";
-    clientId += String(random(0xffff), HEX);
+    String clientId = "smoky-" SMOKY_ID;
+    // clientId += String(random(0xffff), HEX);
     // Attempt to connect
     if (mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword)) {
       Serial.println("connected");
@@ -432,28 +490,36 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if(strcmp(topic, mqttTopicInAck) == 0) {
     mqttStatus = MQTT_STATUS_ACKNOWLEDGED;
   } else if(strcmp(topic, mqttTopicInSetTemp) == 0) {
-    temperatureSetting = payloadToFloat(payload, length, temperatureSetting);
+    settings.temp = payloadToFloat(payload, length, settings.temp);
+    writeSettingsToEEPROM();
+    writeMqttSettings();
   } else if(strcmp(topic, mqttTopicInSetKp) == 0) {
-    Kp = payloadToFloat(payload, length, Kp);
-    heaterPID.SetTunings(Kp, Ki, Kd);
+    settings.Kp = payloadToFloat(payload, length, settings.Kp);
+    heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
+    writeSettingsToEEPROM();
+    writeMqttSettings();
   } else if(strcmp(topic, mqttTopicInSetKi) == 0) {
-    Ki = payloadToFloat(payload, length, Ki);
-    heaterPID.SetTunings(Kp, Ki, Kd);
+    settings.Ki = payloadToFloat(payload, length, settings.Ki);
+    heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
+    writeSettingsToEEPROM();
+    writeMqttSettings();
   } else if(strcmp(topic, mqttTopicInSetKd) == 0) {
-    Kd = payloadToFloat(payload, length, Kd);
-    heaterPID.SetTunings(Kp, Ki, Kd);
+    settings.Kd = payloadToFloat(payload, length, settings.Kd);
+    heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
+    writeSettingsToEEPROM();
+    writeMqttSettings();
   } else if(strcmp(topic, mqttTopicInSetFan) == 0) {
-    int setting = payloadToInt(payload, length, fanSetting);
-    if (setting < 0) fanSetting = 0;
-    else if (setting > 100) fanSetting = 100;
-    else fanSetting = setting;
-    fan.setDutyCycle(fanSetting);
-    Serial.print("Fan setting input = ");
-    Serial.print(setting);
-    Serial.print("   Calculated to: ");
-    Serial.println(fanSetting);
+    int setting = payloadToInt(payload, length, settings.fan);
+    if (setting < 0) setting = 0;
+    if (setting > 100) setting = 100;
+    settings.fan = setting;
+    fan.setDutyCycle(settings.fan);
+    writeSettingsToEEPROM();
+    writeMqttSettings();
+    Serial.print("Fan setting = ");
+    Serial.println(settings.fan);
   } else if(strcmp(topic, mqttTopicInReadSettings) == 0) {
-    readSettings = true;
+    writeMqttSettings();
   }
 }
 
