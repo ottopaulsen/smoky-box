@@ -7,7 +7,6 @@
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
 #include <PID_v1.h>
-#include <FanController.h>
 #include <EEPROM.h>
 
 #include "secrets.h"
@@ -18,8 +17,9 @@
  *   #define UPDATEOTAPASSWORD "secret"
  */
 
- #define SMOKY_ID "2"
- #define PRODUCTION 0 // 1 to go Live, 0 to test
+
+#define SMOKY_ID "2"
+#define PRODUCTION 0 // 1 to go Live, 0 to test
 
 unsigned long looptime = 0;
 
@@ -47,18 +47,27 @@ const char* mqttTopicOutsideHumidity = MQTT_TOPIC_OUT "/outside/humidity";
 const char* mqttTopicSmoke = MQTT_TOPIC_OUT "/inside/smoke";
 const char* mqttTopicHeaterPercent = MQTT_TOPIC_OUT "/inside/heaterpercent";
 const char* mqttTopicHeaterOutput = MQTT_TOPIC_OUT "/inside/heateroutput";
-const char* mqttTopicOutSettings = MQTT_TOPIC_OUT "/settings";
+const char* mqttTopicOutSettingsTemp = MQTT_TOPIC_OUT "/settings/temp";
+const char* mqttTopicOutSettingsKp = MQTT_TOPIC_OUT "/settings/kp";
+const char* mqttTopicOutSettingsKi = MQTT_TOPIC_OUT "/settings/ki";
+const char* mqttTopicOutSettingsKd = MQTT_TOPIC_OUT "/settings/kd";
+const char* mqttTopicOutSettingsFanVent = MQTT_TOPIC_OUT "/settings/fan_vent";
+const char* mqttTopicOutSettingsFanCirc = MQTT_TOPIC_OUT "/settings/fan_circ";
+const char* mqttTopicOutSettingsHeaterOutput = MQTT_TOPIC_OUT "/settings/heateroutput";
 const char* mqttTopicOutConnecting = MQTT_TOPIC_OUT "/connecting";
 const char* mqttTopicDhtReadFailures = MQTT_TOPIC_OUT "/dhtreadfailures";
 const char* mqttTopicOutMsg = MQTT_TOPIC_OUT "/msg";
-const char* mqttTopicFanSetting = MQTT_TOPIC_OUT "/fan/setting";
-const char* mqttTopicFanSpeed = MQTT_TOPIC_OUT "/fan/speedRPM";
+const char* mqttTopicFanVentSetting = MQTT_TOPIC_OUT "/fan_vent/setting";
+const char* mqttTopicFanCircSetting = MQTT_TOPIC_OUT "/fan_circ/setting";
+const char* mqttTopicFanVentSpeed = MQTT_TOPIC_OUT "/fan_vent/speedRPM";
+const char* mqttTopicFanCircSpeed = MQTT_TOPIC_OUT "/fan_circ/speedRPM";
 const char* mqttTopicInAck = MQTT_TOPIC_IN "/ack";
 const char* mqttTopicInSetTemp = MQTT_TOPIC_IN "/temp";
 const char* mqttTopicInSetKp = MQTT_TOPIC_IN "/kp";
 const char* mqttTopicInSetKi = MQTT_TOPIC_IN "/ki";
 const char* mqttTopicInSetKd = MQTT_TOPIC_IN "/kd";
-const char* mqttTopicInSetFan = MQTT_TOPIC_IN "/fan";
+const char* mqttTopicInSetFanVent = MQTT_TOPIC_IN "/fan_vent";
+const char* mqttTopicInSetFanCirc = MQTT_TOPIC_IN "/fan_circ";
 const char* mqttTopicInReadSettings = MQTT_TOPIC_IN "/read";
 
 
@@ -79,13 +88,10 @@ unsigned long ledPreviousMillis = 0;
 // Smoke
 #define SMOKEPIN A0
 
-// Serial
-const long serialWriteInterval = 5000;
-unsigned long serialPreviousWriteMillis = 0;
 
 // Temperature and humidity
-#define DHTINSIDE 2
-#define DHTOUTSIDE 4
+#define DHTINSIDE 2 // D4
+#define DHTOUTSIDE 4 // D2
 #define DHTTYPE DHT22
 DHT dhtInside(DHTINSIDE, DHTTYPE);
 DHT dhtOutside(DHTOUTSIDE, DHTTYPE);
@@ -110,13 +116,14 @@ struct SmokySettings {
   float Ki;
   float Kd;
   double temp;
-  int fan;
+  int fanVent;
+  int fanCirc;
 };
 SmokySettings settings;
 
 
 // Heater control
-#define HEATERPIN 12
+#define HEATERPIN 12 // D6
 //#define INITIALTEMPSETTING 5.0
 int pidWindowSize = 5000;
 unsigned long maxHeaterOutput = 100;
@@ -142,33 +149,31 @@ const char* update_password = UPDATEOTAPASSWORD;
 ESP8266WebServer httpServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
-// Fan
-#define FAN_SENSOR_PIN 1
-#define FAN_SENSOR_THRESHOLD 1000
-#define FAN_PWM_PIN 3
-FanController fan(FAN_SENSOR_PIN, FAN_SENSOR_THRESHOLD, FAN_PWM_PIN);
-int fanSetting = 0; // 0-100
-int fanActualSetting = 0; // 0-100
-int fanSpeedRPM = 0; // Actual speed
+// Fan ventilation
+#define FAN_VENT_SENSOR_PIN 1 // D10 or TX
+#define FAN_VENT_PWM_PIN 3 // D9 or RX
+unsigned long fanVentSpeedRPM = 0; // Actual speed
+volatile unsigned long fanVentCount = 0;
+
+// Fan circulation
+#define FAN_CIRC_SENSOR_PIN 13 // D7
+#define FAN_CIRC_PWM_PIN 15 // D8
+unsigned long fanCircSpeedRPM = 0; // Actual speed
+volatile unsigned long fanCircCount = 0;
+
+// Fan common
+unsigned long previousFanMillis = 0;
+unsigned long fanInterval = 500;
 
 
 void setup() {
 
-  // Serial
-  Serial.begin(115200);
-
   // WiFi
   delay(10);
-  Serial.print("Connecting wifi");
   WiFi.begin(wifiSsid, wifiPassword);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
 
   // Temperature and humidity
   dhtInside.begin();
@@ -200,13 +205,19 @@ void setup() {
   httpUpdater.setup(&httpServer, update_path, update_username, update_password);
   httpServer.begin();
   MDNS.addService("http", "tcp", 80);
-  Serial.printf("HTTPUpdateServer ready! Open http://%s.local%s in your browser and login with username '%s' and password '%s'\n", host, update_path, update_username, update_password);
 
   // LED
   ledPreviousMillis = 0;
 
-  // Fan
-  fan.begin();  
+  // Fan ventilation
+  pinMode(FAN_VENT_PWM_PIN, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_VENT_SENSOR_PIN), countFanVent, RISING);
+  pinMode(FAN_VENT_SENSOR_PIN, INPUT_PULLUP);
+
+  // Fan circulation
+  pinMode(FAN_CIRC_PWM_PIN, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_CIRC_SENSOR_PIN), countFanCirc, RISING);
+  pinMode(FAN_CIRC_SENSOR_PIN, INPUT_PULLUP);
 
   writeMqttSettings();
 
@@ -224,7 +235,8 @@ void readSettingsFromEEPROM(){
     settings.Ki = DEFAULT_KI;
     settings.Kd = DEFAULT_KD;
     settings.temp = DEFAULT_TEMP;
-    settings.fan = DEFAULT_FAN;
+    settings.fanVent = DEFAULT_FAN;
+    settings.fanCirc = DEFAULT_FAN;
     EEPROM.put(0, settings);
   }
 }
@@ -234,7 +246,6 @@ void writeSettingsToEEPROM(){
   mqttSend(mqttTopicOutMsg, String("Writing EEPROM").c_str());
   EEPROM.put(eeAddress, settings);
   EEPROM.commit();
-  mqttSend(mqttTopicOutMsg, String(settings.temp).c_str());
 }
 
 void loop() {
@@ -246,7 +257,6 @@ void loop() {
   loopBlinkLed();
   smoke = analogRead(SMOKEPIN);
   loopBlinkLed();
-  loopWriteSerial();  
   loopBlinkLed();
   loopWriteMqtt();
   loopBlinkLed();
@@ -266,7 +276,6 @@ void loopReadTempHumid(){
     if (isnan(temperatureInside)) {
       temperatureInside = prevTi;
       dhtReadFailures++;
-      //Serial.println("DHT22 Read error");
       if(PRODUCTION) mqttSend(mqttTopicOutMsg, String("DHT22 Read error").c_str());
     }
     humidityInside = dhtInside.readHumidity();
@@ -299,14 +308,6 @@ void loopControlHeater(){
   heaterPreviousCalcMillis = currentMillis;  
 }
 
-void loopWriteSerial(){
-  unsigned long currentMillis = millis();
-  if(currentMillis - serialPreviousWriteMillis >= serialWriteInterval) {
-    writeSerial();
-    serialPreviousWriteMillis = currentMillis;
-  }  
-}
-
 void loopWriteMqtt(){
   //reconnectMqtt();
   unsigned long currentMillis = looptime;
@@ -317,8 +318,27 @@ void loopWriteMqtt(){
 }
 
 void loopFan(){
-    fanSpeedRPM = fan.getSpeed(); // Send the command to get RPM  
-    fanActualSetting = fan.getDutyCycle();
+  unsigned long currentMillis = millis();
+  if(currentMillis - previousFanMillis >= fanInterval) {
+    unsigned long countTime = currentMillis - previousFanMillis;
+    noInterrupts();
+    fanVentSpeedRPM = (fanVentCount * (30000 / countTime)); // 1000 ms * 60 sek / 2 counts per round
+    fanVentCount = 0;
+    fanCircSpeedRPM = (fanCircCount * (30000 / countTime)); // 1000 ms * 60 sek / 2 counts per round
+    fanCircCount = 0;
+    interrupts();
+    previousFanMillis = currentMillis;
+    analogWrite(FAN_VENT_PWM_PIN, map(settings.fanVent, 0, 100, 0, 1023));
+    analogWrite(FAN_CIRC_PWM_PIN, map(settings.fanCirc, 0, 100, 0, 1023));
+  }
+}
+
+void countFanVent(){ 
+  fanVentCount++;
+}
+
+void countFanCirc(){ 
+  fanCircCount++;
 }
 
 void mqttSend(const char* topic, const char* msg){
@@ -342,7 +362,6 @@ void loopBlinkLed(){
     } else if(mqttStatus == MQTT_STATUS_SENDING){
       greenLed = not greenLed;
     } else {
-      Serial.println("Unknown MQTT status");
       greenLed = false;
     }
     ledPreviousMillis = currentMillis;
@@ -356,61 +375,9 @@ void loopBlinkLed(){
 }
 
 
-void writeSerial(){
-
-
-  Serial.print("Fan setting: ");
-  Serial.print(fanSetting);
-  Serial.print("   Actual setting: ");
-  Serial.print(fanActualSetting);
-  Serial.print("   RPM: ");
-  Serial.print(fanSpeedRPM);
-  Serial.println("");
-
-  //return;
-
-  Serial.print("Smoke level: ");
-  Serial.print(smoke, 3);
-  
-  Serial.print("    Temperature inside: ");
-  Serial.print(temperatureInside, 1);
-  Serial.print(" C");
-  
-  Serial.print("    Temperature outside: ");
-  Serial.print(temperatureOutside, 1);
-  Serial.print(" C");
-  
-  Serial.print("    Humidity inside: ");
-  Serial.print(humidityInside, 1);
-  Serial.print("");
-
-  Serial.print("    Humidity outside: ");
-  Serial.print(humidityOutside, 1);
-  Serial.print("");
-
-  Serial.print("    heaterOutput: ");
-  Serial.print(heaterOutput, 1);
-  Serial.print("");
-  
-  Serial.print("    Heat %: ");
-  Serial.print(heaterOnPercent, 1);
-  Serial.print("");
-
-  Serial.print("    TempSetting %: ");
-  Serial.print(settings.temp, 1);
-  Serial.print("");
-
-  Serial.print("    FanSetting %: ");
-  Serial.print(settings.fan, 1);
-  Serial.print("");
-
-  Serial.println("");
-}
-
 void writeMqtt(){
   mqttStatus = MQTT_STATUS_SENDING;
   reconnectMqtt();
-  Serial.println("Sending MQTT data");
 
   mqttClient.publish(mqttTopicInsideTemperature, String(temperatureInside).c_str());
   mqttClient.publish(mqttTopicInsideHumidity, String(humidityInside).c_str());
@@ -420,22 +387,22 @@ void writeMqtt(){
   mqttClient.publish(mqttTopicHeaterPercent, String(heaterOnPercent * 100.0).c_str());
   mqttClient.publish(mqttTopicHeaterOutput, (String(heaterOutput)).c_str());
   mqttClient.publish(mqttTopicDhtReadFailures, (String(dhtReadFailures)).c_str());
-  mqttClient.publish(mqttTopicFanSpeed, (String(fanSpeedRPM)).c_str());
+  mqttClient.publish(mqttTopicFanVentSpeed, (String(fanVentSpeedRPM)).c_str());
+  mqttClient.publish(mqttTopicFanCircSpeed, (String(fanCircSpeedRPM)).c_str());
   heaterOnPercent = 0.0;
 }
 
 void writeMqttSettings(){
   mqttStatus = MQTT_STATUS_SENDING;
   reconnectMqtt();
-  Serial.println("Sending settings to MQTT");
 
-  mqttClient.publish(mqttTopicFanSetting, (String(fanActualSetting)).c_str());
-  mqttClient.publish(mqttTopicOutSettings, (String("temperatureSetting = ") + String(settings.temp)).c_str());
-  mqttClient.publish(mqttTopicOutSettings, (String("heaterOutput = ") + String(heaterOutput)).c_str());
-  mqttClient.publish(mqttTopicOutSettings, (String("Kp = ") + String(settings.Kp)).c_str());
-  mqttClient.publish(mqttTopicOutSettings, (String("Ki = ") + String(settings.Ki)).c_str());
-  mqttClient.publish(mqttTopicOutSettings, (String("Kd = ") + String(settings.Kd)).c_str());
-  mqttClient.publish(mqttTopicOutSettings, (String("Fan = ") + String(settings.fan)).c_str());
+  mqttClient.publish(mqttTopicOutSettingsTemp, String(settings.temp).c_str());
+  mqttClient.publish(mqttTopicOutSettingsHeaterOutput, String(heaterOutput).c_str());
+  mqttClient.publish(mqttTopicOutSettingsKp, String(settings.Kp).c_str());
+  mqttClient.publish(mqttTopicOutSettingsKi, String(settings.Ki).c_str());
+  mqttClient.publish(mqttTopicOutSettingsKd, String(settings.Kd).c_str());
+  mqttClient.publish(mqttTopicOutSettingsFanVent, String(settings.fanVent).c_str());
+  mqttClient.publish(mqttTopicOutSettingsFanCirc, String(settings.fanCirc).c_str());
 }
 
 void reconnectMqtt() {
@@ -446,13 +413,11 @@ void reconnectMqtt() {
 
   // Loop until we're reconnected
   if (!mqttClient.connected()) {
-    Serial.print("Attempting MQTT connection...");
     // Create a random client ID
     String clientId = "smoky-" SMOKY_ID;
     // clientId += String(random(0xffff), HEX);
     // Attempt to connect
     if (mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword)) {
-      Serial.println("connected");
       // Once connected, publish an announcement...
       if(mqttStatus == MQTT_STATUS_UNKNOWN) {
         mqttClient.publish(mqttTopicOutConnecting, "Smoky starting");
@@ -462,14 +427,9 @@ void reconnectMqtt() {
 
       // ... and resubscribe
       if(mqttClient.subscribe(MQTT_TOPIC_IN "/#", 1)){
-        Serial.println("Subscribe ok");
       } else {
-        Serial.println("Subscribe failed");
       }
     } else {
-      Serial.print("failed, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(" try again next time");
     }
   }
 }
@@ -478,13 +438,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   /*
    * Callback for subscribed messages
    */
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
   for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
   }
-  Serial.println("");
 
   // Set status to turn on green led if ack is received
   if(strcmp(topic, mqttTopicInAck) == 0) {
@@ -492,32 +447,36 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   } else if(strcmp(topic, mqttTopicInSetTemp) == 0) {
     settings.temp = payloadToFloat(payload, length, settings.temp);
     writeSettingsToEEPROM();
-    writeMqttSettings();
+    mqttSend(mqttTopicOutSettingsTemp, String(settings.temp).c_str());
   } else if(strcmp(topic, mqttTopicInSetKp) == 0) {
     settings.Kp = payloadToFloat(payload, length, settings.Kp);
     heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     writeSettingsToEEPROM();
-    writeMqttSettings();
+    mqttSend(mqttTopicOutSettingsKp, String(settings.Kp).c_str());
   } else if(strcmp(topic, mqttTopicInSetKi) == 0) {
     settings.Ki = payloadToFloat(payload, length, settings.Ki);
     heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     writeSettingsToEEPROM();
-    writeMqttSettings();
+    mqttSend(mqttTopicOutSettingsKi, String(settings.Ki).c_str());
   } else if(strcmp(topic, mqttTopicInSetKd) == 0) {
     settings.Kd = payloadToFloat(payload, length, settings.Kd);
     heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     writeSettingsToEEPROM();
-    writeMqttSettings();
-  } else if(strcmp(topic, mqttTopicInSetFan) == 0) {
-    int setting = payloadToInt(payload, length, settings.fan);
+    mqttSend(mqttTopicOutSettingsKd, String(settings.Kd).c_str());
+  } else if(strcmp(topic, mqttTopicInSetFanVent) == 0) {
+    int setting = payloadToInt(payload, length, settings.fanVent);
     if (setting < 0) setting = 0;
     if (setting > 100) setting = 100;
-    settings.fan = setting;
-    fan.setDutyCycle(settings.fan);
+    settings.fanVent = setting;
     writeSettingsToEEPROM();
-    writeMqttSettings();
-    Serial.print("Fan setting = ");
-    Serial.println(settings.fan);
+    mqttSend(mqttTopicOutSettingsFanVent, String(settings.fanVent).c_str());
+  } else if(strcmp(topic, mqttTopicInSetFanCirc) == 0) {
+    int setting = payloadToInt(payload, length, settings.fanCirc);
+    if (setting < 0) setting = 0;
+    if (setting > 100) setting = 100;
+    settings.fanCirc = setting;
+    writeSettingsToEEPROM();
+    mqttSend(mqttTopicOutSettingsFanCirc, String(settings.fanCirc).c_str());
   } else if(strcmp(topic, mqttTopicInReadSettings) == 0) {
     writeMqttSettings();
   }
