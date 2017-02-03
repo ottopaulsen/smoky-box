@@ -18,8 +18,8 @@
  */
 
 
-#define SMOKY_ID "2"
-#define PRODUCTION 0 // 1 to go Live, 0 to test
+#define SMOKY_ID "1"
+#define PRODUCTION 1 // 1 to go Live, 0 to test
 
 unsigned long looptime = 0;
 
