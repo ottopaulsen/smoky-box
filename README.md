@@ -20,7 +20,15 @@ Blå: Control. PWM kontrollerer farta. 3,3V fungerer.
 
 Use analogWrite() to write a value between 0 and 1023 on any of pin 0-8. You may not use the serial port if you use the serial pins.
 
+## Components
+
+DHT22 pinout:
+
+![DHT22 Pinout](http://electropark.pl/img/cms/Czujniki/temperatury/dht22_wyproadzenia.jpg)
+
 ## Generell doc
+
+[ESP8266 Reference Doc](http://arduino.esp8266.com/versions/1.6.5-1160-gef26c5f/doc/reference.html) Lots of useful information.
 
 [How to connect and program the ESP8266](doc/ESP8266 Programming.md)
 

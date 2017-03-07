@@ -124,15 +124,12 @@ SmokySettings settings;
 
 // Heater control
 #define HEATERPIN 12 // D6
-//#define INITIALTEMPSETTING 5.0
-int pidWindowSize = 5000;
+unsigned long pidWindowSize = 5000;
+unsigned long pidLoopTime = 1000;
 unsigned long maxHeaterOutput = 100;
-float heaterOnPercent = 0.0;
 bool heaterOn = false;
 unsigned long heaterPreviousCalcMillis = 0;
 unsigned long heaterPreviousPidWindow = 0;
-//double temperatureSetting =  5.0;
-//float Kp =  5.0, Ki =  0.05, Kd =  0.5;
 double heaterOutput =  10.0;
 PID heaterPID(&temperatureInside, &heaterOutput, &(settings.temp), settings.Kp, settings.Ki, settings.Kd, DIRECT);
 
@@ -257,7 +254,6 @@ void loop() {
   loopBlinkLed();
   smoke = analogRead(SMOKEPIN);
   loopBlinkLed();
-  loopBlinkLed();
   loopWriteMqtt();
   loopBlinkLed();
   mqttClient.loop();
@@ -289,27 +285,25 @@ void loopControlHeater(){
 
   unsigned long currentMillis = looptime;
 
-  if (heaterOn) {
-    heaterOnPercent += (currentMillis - heaterPreviousCalcMillis) / (float) mqttInterval;
-  }
+  if (currentMillis >= (heaterPreviousCalcMillis + pidLoopTime)) {
   
-  heaterPID.Compute();
-  
-  if (currentMillis - heaterPreviousPidWindow > pidWindowSize) { //time to shift the Relay Window
-    heaterPreviousPidWindow += pidWindowSize;
+    heaterPID.Compute();
+    
+    if (currentMillis - heaterPreviousPidWindow > pidWindowSize) { //time to shift the Relay Window
+      heaterPreviousPidWindow += pidWindowSize;
+    }
+    if (heaterOutput > maxHeaterOutput * (currentMillis - heaterPreviousPidWindow) / pidWindowSize) {
+      digitalWrite(HEATERPIN, HIGH); // On
+      heaterOn = true;
+    } else {
+      digitalWrite(HEATERPIN, LOW); // Off
+      heaterOn = false;
+    }
+    heaterPreviousCalcMillis = currentMillis;  
   }
-  if (heaterOutput > maxHeaterOutput * (currentMillis - heaterPreviousPidWindow) / pidWindowSize) {
-    digitalWrite(HEATERPIN, HIGH); // On
-    heaterOn = true;
-  } else {
-    digitalWrite(HEATERPIN, LOW); // Off
-    heaterOn = false;
-  }
-  heaterPreviousCalcMillis = currentMillis;  
 }
 
 void loopWriteMqtt(){
-  //reconnectMqtt();
   unsigned long currentMillis = looptime;
   if(currentMillis - mqttPreviousSentMillis >= mqttInterval) {
     writeMqtt();
@@ -384,12 +378,10 @@ void writeMqtt(){
   mqttClient.publish(mqttTopicOutsideTemperature, String(temperatureOutside).c_str());
   mqttClient.publish(mqttTopicOutsideHumidity, String(humidityOutside).c_str());
   mqttClient.publish(mqttTopicSmoke, String(smoke).c_str());
-  mqttClient.publish(mqttTopicHeaterPercent, String(heaterOnPercent * 100.0).c_str());
   mqttClient.publish(mqttTopicHeaterOutput, (String(heaterOutput)).c_str());
   mqttClient.publish(mqttTopicDhtReadFailures, (String(dhtReadFailures)).c_str());
   mqttClient.publish(mqttTopicFanVentSpeed, (String(fanVentSpeedRPM)).c_str());
   mqttClient.publish(mqttTopicFanCircSpeed, (String(fanCircSpeedRPM)).c_str());
-  heaterOnPercent = 0.0;
 }
 
 void writeMqttSettings(){
@@ -406,16 +398,9 @@ void writeMqttSettings(){
 }
 
 void reconnectMqtt() {
-  /* 
-   * This code is copied from an example.
-   * Not sure it is the optimal usage of the client id.
-   */
-
-  // Loop until we're reconnected
   if (!mqttClient.connected()) {
     // Create a random client ID
     String clientId = "smoky-" SMOKY_ID;
-    // clientId += String(random(0xffff), HEX);
     // Attempt to connect
     if (mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword)) {
       // Once connected, publish an announcement...
@@ -425,45 +410,40 @@ void reconnectMqtt() {
         mqttClient.publish(mqttTopicOutConnecting, "Smoky reconnecting");
       }
 
-      // ... and resubscribe
-      if(mqttClient.subscribe(MQTT_TOPIC_IN "/#", 1)){
-      } else {
-      }
-    } else {
+      mqttClient.subscribe(MQTT_TOPIC_IN "/#", 1);
     }
   }
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  /*
-   * Callback for subscribed messages
-   */
-  for (int i = 0; i < length; i++) {
-  }
-
-  // Set status to turn on green led if ack is received
   if(strcmp(topic, mqttTopicInAck) == 0) {
+    // Set status to turn on green led if ack is received
     mqttStatus = MQTT_STATUS_ACKNOWLEDGED;
   } else if(strcmp(topic, mqttTopicInSetTemp) == 0) {
+    // Set temp
     settings.temp = payloadToFloat(payload, length, settings.temp);
     writeSettingsToEEPROM();
     mqttSend(mqttTopicOutSettingsTemp, String(settings.temp).c_str());
   } else if(strcmp(topic, mqttTopicInSetKp) == 0) {
+    // Set Kp
     settings.Kp = payloadToFloat(payload, length, settings.Kp);
     heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     writeSettingsToEEPROM();
     mqttSend(mqttTopicOutSettingsKp, String(settings.Kp).c_str());
   } else if(strcmp(topic, mqttTopicInSetKi) == 0) {
+    // Set Ki
     settings.Ki = payloadToFloat(payload, length, settings.Ki);
     heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     writeSettingsToEEPROM();
     mqttSend(mqttTopicOutSettingsKi, String(settings.Ki).c_str());
   } else if(strcmp(topic, mqttTopicInSetKd) == 0) {
+    // Set Kd
     settings.Kd = payloadToFloat(payload, length, settings.Kd);
     heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     writeSettingsToEEPROM();
     mqttSend(mqttTopicOutSettingsKd, String(settings.Kd).c_str());
   } else if(strcmp(topic, mqttTopicInSetFanVent) == 0) {
+    // Set ventilation fan speed
     int setting = payloadToInt(payload, length, settings.fanVent);
     if (setting < 0) setting = 0;
     if (setting > 100) setting = 100;
@@ -471,6 +451,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     writeSettingsToEEPROM();
     mqttSend(mqttTopicOutSettingsFanVent, String(settings.fanVent).c_str());
   } else if(strcmp(topic, mqttTopicInSetFanCirc) == 0) {
+    // Set circulation fan speed
     int setting = payloadToInt(payload, length, settings.fanCirc);
     if (setting < 0) setting = 0;
     if (setting > 100) setting = 100;
@@ -478,11 +459,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     writeSettingsToEEPROM();
     mqttSend(mqttTopicOutSettingsFanCirc, String(settings.fanCirc).c_str());
   } else if(strcmp(topic, mqttTopicInReadSettings) == 0) {
+    // Read settings
     writeMqttSettings();
   }
 }
-
-
 
 double payloadToFloat(byte* payload, unsigned int length, double defaultValue){
   payload[length] = '\0';
