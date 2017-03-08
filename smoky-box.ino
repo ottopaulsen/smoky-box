@@ -21,8 +21,6 @@
 #define SMOKY_ID "1"
 #define PRODUCTION 1 // 1 to go Live, 0 to test
 
-unsigned long looptime = 0;
-
 // WiFi
 const char* wifiSsid = "Xtreme";
 const char* wifiPassword = WIFIPASSWORD;
@@ -61,6 +59,12 @@ const char* mqttTopicFanVentSetting = MQTT_TOPIC_OUT "/fan_vent/setting";
 const char* mqttTopicFanCircSetting = MQTT_TOPIC_OUT "/fan_circ/setting";
 const char* mqttTopicFanVentSpeed = MQTT_TOPIC_OUT "/fan_vent/speedRPM";
 const char* mqttTopicFanCircSpeed = MQTT_TOPIC_OUT "/fan_circ/speedRPM";
+const char* mqttTopicLooptimeMax = MQTT_TOPIC_OUT "/looptime/max";
+const char* mqttTopicLooptimeMin = MQTT_TOPIC_OUT "/looptime/min";
+const char* mqttTopicLooptimeAverage = MQTT_TOPIC_OUT "/looptime/average";
+const char* mqttTopicLooptimeLatest = MQTT_TOPIC_OUT "/looptime/latest";
+const char* mqttTopicLooptimeCount = MQTT_TOPIC_OUT "/looptime/count";
+
 const char* mqttTopicInAck = MQTT_TOPIC_IN "/ack";
 const char* mqttTopicInSetTemp = MQTT_TOPIC_IN "/temp";
 const char* mqttTopicInSetKp = MQTT_TOPIC_IN "/kp";
@@ -124,8 +128,9 @@ SmokySettings settings;
 
 // Heater control
 #define HEATERPIN 12 // D6
+#define HEATER_PID_SAMPLE_TIME 1000
 unsigned long pidWindowSize = 5000;
-unsigned long pidLoopTime = 1000;
+//unsigned long pidLoopTime = 1000;
 unsigned long maxHeaterOutput = 100;
 bool heaterOn = false;
 unsigned long heaterPreviousCalcMillis = 0;
@@ -162,8 +167,21 @@ volatile unsigned long fanCircCount = 0;
 unsigned long previousFanMillis = 0;
 unsigned long fanInterval = 500;
 
+// Loop time
+unsigned long looptime = 0;
+unsigned long previousLooptime = 0;
+unsigned long maxLooptime = 0;
+unsigned long minLooptime = 9999;
+unsigned long latestLooptime = 0;
+unsigned long loopCount = 0;
+double averageLooptime = 0.0;
+
+
 
 void setup() {
+
+  EEPROM.begin(256);
+  readSettingsFromEEPROM();
 
   // WiFi
   delay(10);
@@ -190,12 +208,9 @@ void setup() {
   pinMode(HEATERPIN, OUTPUT);
   heaterPID.SetOutputLimits(0, maxHeaterOutput);
   heaterPID.SetMode(AUTOMATIC);
+  heaterPID.SetSampleTime(HEATER_PID_SAMPLE_TIME);
   heaterPreviousPidWindow = millis();
-
-
-  EEPROM.begin(256);
-  readSettingsFromEEPROM();
-
+  heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
 
   // OTA Update
   MDNS.begin("smoky");
@@ -246,7 +261,7 @@ void writeSettingsToEEPROM(){
 }
 
 void loop() {
-  looptime = millis();
+  calcLoopTime();
   loopBlinkLed();
   loopReadTempHumid();
   loopBlinkLed();
@@ -262,6 +277,39 @@ void loop() {
 
   // OTA Update
   httpServer.handleClient();
+}
+
+void calcLoopTime(){
+  looptime = millis();
+  if(looptime < previousLooptime){
+    // Wrapped arount. Reset time variables.
+    resetTimeVariables();
+  }
+  latestLooptime = looptime - previousLooptime;
+  if (loopCount){
+    averageLooptime += (double) latestLooptime / loopCount;
+    if (latestLooptime < minLooptime){
+      minLooptime = latestLooptime;
+    }
+    if (latestLooptime > maxLooptime){
+      maxLooptime = latestLooptime;
+    }
+  }
+  previousLooptime = looptime;
+  loopCount++;
+}
+
+void resetTimeVariables(){
+  previousLooptime = 0;
+  loopCount = 0;
+  averageLooptime = 0;
+  minLooptime = 9999;
+  maxLooptime = 0;
+  dhtPreviousReadMillis = 0;
+  heaterPreviousPidWindow = 0;
+  mqttPreviousSentMillis = 0;
+  previousFanMillis = 0;
+  ledPreviousMillis = 0;
 }
 
 void loopReadTempHumid(){
@@ -283,31 +331,24 @@ void loopReadTempHumid(){
 
 void loopControlHeater(){
 
-  unsigned long currentMillis = looptime;
-
-  if (currentMillis >= (heaterPreviousCalcMillis + pidLoopTime)) {
+  heaterPID.Compute();
   
-    heaterPID.Compute();
-    
-    if (currentMillis - heaterPreviousPidWindow > pidWindowSize) { //time to shift the Relay Window
-      heaterPreviousPidWindow += pidWindowSize;
-    }
-    if (heaterOutput > maxHeaterOutput * (currentMillis - heaterPreviousPidWindow) / pidWindowSize) {
-      digitalWrite(HEATERPIN, HIGH); // On
-      heaterOn = true;
-    } else {
-      digitalWrite(HEATERPIN, LOW); // Off
-      heaterOn = false;
-    }
-    heaterPreviousCalcMillis = currentMillis;  
+  if (looptime - heaterPreviousPidWindow > pidWindowSize) { //time to shift the Relay Window
+    heaterPreviousPidWindow += pidWindowSize;
+  }
+  if (heaterOutput > maxHeaterOutput * (looptime - heaterPreviousPidWindow) / pidWindowSize) {
+    digitalWrite(HEATERPIN, HIGH); // On
+    heaterOn = true;
+  } else {
+    digitalWrite(HEATERPIN, LOW); // Off
+    heaterOn = false;
   }
 }
 
 void loopWriteMqtt(){
-  unsigned long currentMillis = looptime;
-  if(currentMillis - mqttPreviousSentMillis >= mqttInterval) {
+  if(looptime - mqttPreviousSentMillis >= mqttInterval) {
     writeMqtt();
-    mqttPreviousSentMillis = currentMillis;
+    mqttPreviousSentMillis = looptime;
   }  
 }
 
@@ -382,6 +423,13 @@ void writeMqtt(){
   mqttClient.publish(mqttTopicDhtReadFailures, (String(dhtReadFailures)).c_str());
   mqttClient.publish(mqttTopicFanVentSpeed, (String(fanVentSpeedRPM)).c_str());
   mqttClient.publish(mqttTopicFanCircSpeed, (String(fanCircSpeedRPM)).c_str());
+
+  mqttClient.publish(mqttTopicLooptimeMax, (String(maxLooptime)).c_str());
+  mqttClient.publish(mqttTopicLooptimeMin, (String(minLooptime)).c_str());
+  mqttClient.publish(mqttTopicLooptimeLatest, (String(latestLooptime)).c_str());
+  mqttClient.publish(mqttTopicLooptimeAverage, (String(averageLooptime)).c_str());
+  mqttClient.publish(mqttTopicLooptimeCount, (String(loopCount)).c_str());
+
 }
 
 void writeMqttSettings(){
