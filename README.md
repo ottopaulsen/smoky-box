@@ -26,6 +26,12 @@ DHT22 pinout:
 
 ![DHT22 Pinout](http://electropark.pl/img/cms/Czujniki/temperatury/dht22_wyproadzenia.jpg)
 
+The DHT22 is connected using a 3 pin 3,5mm jack as follows:
+
+* GND is connected to the outer part
+* VCC is connected to the middle part
+* Data is connected to the inner part (center)
+
 ## Generell doc
 
 [ESP8266 Reference Doc](http://arduino.esp8266.com/versions/1.6.5-1160-gef26c5f/doc/reference.html) Lots of useful information.
