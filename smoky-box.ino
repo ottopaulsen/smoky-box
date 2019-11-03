@@ -1,7 +1,4 @@
-
-
 #include <PubSubClient.h>
-//#include <DHT.h>
 #include <DHTesp.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -18,6 +15,20 @@
  *   #define UPDATEOTAPASSWORD "secret"
  */
 
+/* GPIO Allocation
+ * 
+ * D0 GPIO16
+ * D1 GPIO5
+ * D2 GPIO4 DHT Inside
+ * D3 GPIO0
+ * D4 GPIO2 DHT Outside
+ * D5 GPIO14 DHT Box
+ * D6 GPIO12 Heater
+ * D7 GPIO13 Green LED
+ * D8 GPIO15 
+ * RX GPIO3 Fan vent PWM
+ * TX GPIO1 Fan vent sensor
+ */
 
 #define SMOKY_ID "1"
 #define PRODUCTION 1 // 1 to go Live, 0 to test
@@ -53,15 +64,12 @@ const char* mqttTopicOutSettingsKp = MQTT_TOPIC_OUT "/settings/kp";
 const char* mqttTopicOutSettingsKi = MQTT_TOPIC_OUT "/settings/ki";
 const char* mqttTopicOutSettingsKd = MQTT_TOPIC_OUT "/settings/kd";
 const char* mqttTopicOutSettingsFanVent = MQTT_TOPIC_OUT "/settings/fan_vent";
-const char* mqttTopicOutSettingsFanCirc = MQTT_TOPIC_OUT "/settings/fan_circ";
 const char* mqttTopicOutSettingsHeaterOutput = MQTT_TOPIC_OUT "/settings/heateroutput";
 const char* mqttTopicOutConnecting = MQTT_TOPIC_OUT "/connecting";
 const char* mqttTopicDhtReadFailures = MQTT_TOPIC_OUT "/dhtreadfailures";
 const char* mqttTopicOutMsg = MQTT_TOPIC_OUT "/msg";
 const char* mqttTopicFanVentSetting = MQTT_TOPIC_OUT "/fan_vent/setting";
-const char* mqttTopicFanCircSetting = MQTT_TOPIC_OUT "/fan_circ/setting";
 const char* mqttTopicFanVentSpeed = MQTT_TOPIC_OUT "/fan_vent/speedRPM";
-const char* mqttTopicFanCircSpeed = MQTT_TOPIC_OUT "/fan_circ/speedRPM";
 const char* mqttTopicLooptimeMax = MQTT_TOPIC_OUT "/looptime/max";
 const char* mqttTopicLooptimeMin = MQTT_TOPIC_OUT "/looptime/min";
 const char* mqttTopicLooptimeAverage = MQTT_TOPIC_OUT "/looptime/average";
@@ -74,7 +82,6 @@ const char* mqttTopicInSetKp = MQTT_TOPIC_IN "/kp";
 const char* mqttTopicInSetKi = MQTT_TOPIC_IN "/ki";
 const char* mqttTopicInSetKd = MQTT_TOPIC_IN "/kd";
 const char* mqttTopicInSetFanVent = MQTT_TOPIC_IN "/fan_vent";
-const char* mqttTopicInSetFanCirc = MQTT_TOPIC_IN "/fan_circ";
 const char* mqttTopicInReadSettings = MQTT_TOPIC_IN "/read";
 
 // MQTT Status
@@ -95,9 +102,7 @@ unsigned long ledPreviousMillis = 0;
 #define DHTINSIDE 4 // D2
 #define DHTOUTSIDE 2 // D4
 #define DHTBOX 14 // D5
-// Disse er byttet om pga sensorfeil
 
-// #define DHTTYPE DHT22
 #define DHTTYPE DHTesp::AM2302
 DHTesp dhtInside;
 DHTesp dhtOutside;
@@ -113,7 +118,7 @@ unsigned long dhtReadInterval = 2500;
 unsigned long dhtPreviousReadMillis = 0;
 
 // EEPROM Settings
-#define SETTINGS_VERSION 100
+#define SETTINGS_VERSION 101
 #define DEFAULT_KP 5.0
 #define DEFAULT_KI 0.05
 #define DEFAULT_KD 0.5
@@ -126,7 +131,6 @@ struct SmokySettings {
   float Kd;
   double temp;
   int fanVent;
-  int fanCirc;
 };
 SmokySettings settings;
 
@@ -161,12 +165,6 @@ ESP8266HTTPUpdateServer httpUpdater;
 unsigned long fanVentSpeedRPM = 0; // Actual speed
 volatile unsigned long fanVentCount = 0;
 
-// Fan circulation
-#define FAN_CIRC_SENSOR_PIN 13 // D7
-#define FAN_CIRC_PWM_PIN 15 // D8
-unsigned long fanCircSpeedRPM = 0; // Actual speed
-volatile unsigned long fanCircCount = 0;
-
 // Fan common
 unsigned long previousFanMillis = 0;
 unsigned long fanInterval = 500;
@@ -185,22 +183,22 @@ void setup() {
 
   // delay(1000);
 
-  Serial.begin(115200);
-  Serial.println();
-  Serial.println("Starting");
+  // Serial.begin(115200);
+  // Serial.println();
+  // Serial.println("Starting");
 
   EEPROM.begin(256);
   readSettingsFromEEPROM();
 
   // WiFi
   delay(100);
-  Serial.print("Starting wifi");
+  // Serial.print("Starting wifi");
   WiFi.begin(wifiSsid, wifiPassword);
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
+    // Serial.print(".");
     delay(500);
   }
-  Serial.println("Connected");
+  // Serial.println("Connected");
 
   // Temperature and humidity
   dhtInside.setup(DHTINSIDE, DHTTYPE);
@@ -241,13 +239,8 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(FAN_VENT_SENSOR_PIN), countFanVent, RISING);
   pinMode(FAN_VENT_SENSOR_PIN, INPUT_PULLUP);
 
-  // Fan circulation
-  pinMode(FAN_CIRC_PWM_PIN, OUTPUT);
-  attachInterrupt(digitalPinToInterrupt(FAN_CIRC_SENSOR_PIN), countFanCirc, RISING);
-  pinMode(FAN_CIRC_SENSOR_PIN, INPUT_PULLUP);
-
   writeMqttSettings();
-  Serial.println("Setup done");
+  // Serial.println("Setup done");
 
 }
 
@@ -264,7 +257,6 @@ void readSettingsFromEEPROM(){
     settings.Kd = DEFAULT_KD;
     settings.temp = DEFAULT_TEMP;
     settings.fanVent = DEFAULT_FAN;
-    settings.fanCirc = DEFAULT_FAN;
     EEPROM.put(0, settings);
   }
 }
@@ -386,21 +378,14 @@ void loopFan(){
     noInterrupts();
     fanVentSpeedRPM = (fanVentCount * (30000 / countTime)); // 1000 ms * 60 sek / 2 counts per round
     fanVentCount = 0;
-    fanCircSpeedRPM = (fanCircCount * (30000 / countTime)); // 1000 ms * 60 sek / 2 counts per round
-    fanCircCount = 0;
     interrupts();
     previousFanMillis = currentMillis;
     analogWrite(FAN_VENT_PWM_PIN, map(settings.fanVent, 0, 100, 0, 1023));
-    analogWrite(FAN_CIRC_PWM_PIN, map(settings.fanCirc, 0, 100, 0, 1023));
   }
 }
 
 void countFanVent(){ 
   fanVentCount++;
-}
-
-void countFanCirc(){ 
-  fanCircCount++;
 }
 
 void mqttSend(const char* topic, const char* msg){
@@ -458,7 +443,6 @@ void writeMqtt(){
   mqttClient.publish(mqttTopicHeaterOutput, (String(heaterOutput)).c_str());
   mqttClient.publish(mqttTopicDhtReadFailures, (String(dhtReadFailures)).c_str());
 //  mqttClient.publish(mqttTopicFanVentSpeed, (String(fanVentSpeedRPM)).c_str());
-//  mqttClient.publish(mqttTopicFanCircSpeed, (String(fanCircSpeedRPM)).c_str());
 
 //  mqttClient.publish(mqttTopicLooptimeMax, (String(maxLooptime)).c_str());
 //  mqttClient.publish(mqttTopicLooptimeMin, (String(minLooptime)).c_str());
@@ -478,7 +462,6 @@ void writeMqttSettings(){
   mqttClient.publish(mqttTopicOutSettingsKi, String(settings.Ki).c_str());
   mqttClient.publish(mqttTopicOutSettingsKd, String(settings.Kd).c_str());
   mqttClient.publish(mqttTopicOutSettingsFanVent, String(settings.fanVent).c_str());
-  mqttClient.publish(mqttTopicOutSettingsFanCirc, String(settings.fanCirc).c_str());
 }
 
 void reconnectMqtt() {
@@ -534,14 +517,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     settings.fanVent = setting;
     writeSettingsToEEPROM();
     mqttSend(mqttTopicOutSettingsFanVent, String(settings.fanVent).c_str());
-  } else if(strcmp(topic, mqttTopicInSetFanCirc) == 0) {
-    // Set circulation fan speed
-    int setting = payloadToInt(payload, length, settings.fanCirc);
-    if (setting < 0) setting = 0;
-    if (setting > 100) setting = 100;
-    settings.fanCirc = setting;
-    writeSettingsToEEPROM();
-    mqttSend(mqttTopicOutSettingsFanCirc, String(settings.fanCirc).c_str());
   } else if(strcmp(topic, mqttTopicInReadSettings) == 0) {
     // Read settings
     writeMqttSettings();
