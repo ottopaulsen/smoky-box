@@ -1,7 +1,8 @@
 
 
 #include <PubSubClient.h>
-#include <DHT.h>
+//#include <DHT.h>
+#include <DHTesp.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
@@ -42,6 +43,8 @@ const char* mqttTopicInsideTemperature = MQTT_TOPIC_OUT "/inside/temperature";
 const char* mqttTopicInsideHumidity = MQTT_TOPIC_OUT "/inside/humidity";
 const char* mqttTopicOutsideTemperature = MQTT_TOPIC_OUT "/outside/temperature";
 const char* mqttTopicOutsideHumidity = MQTT_TOPIC_OUT "/outside/humidity";
+const char* mqttTopicBoxTemperature = MQTT_TOPIC_OUT "/box/temperature";
+const char* mqttTopicBoxHumidity = MQTT_TOPIC_OUT "/box/humidity";
 const char* mqttTopicSmoke = MQTT_TOPIC_OUT "/inside/smoke";
 const char* mqttTopicHeaterPercent = MQTT_TOPIC_OUT "/inside/heaterpercent";
 const char* mqttTopicHeaterOutput = MQTT_TOPIC_OUT "/inside/heateroutput";
@@ -74,10 +77,6 @@ const char* mqttTopicInSetFanVent = MQTT_TOPIC_IN "/fan_vent";
 const char* mqttTopicInSetFanCirc = MQTT_TOPIC_IN "/fan_circ";
 const char* mqttTopicInReadSettings = MQTT_TOPIC_IN "/read";
 
-
-// MQTT text messages
-const char* mqttMsgInsideTempNan = "Error reading inside temperature";
-
 // MQTT Status
 #define MQTT_STATUS_UNKNOWN 0
 #define MQTT_STATUS_SENDING 1
@@ -92,19 +91,25 @@ unsigned long ledPreviousMillis = 0;
 // Smoke
 #define SMOKEPIN A0
 
-
 // Temperature and humidity
-#define DHTINSIDE 2 // D4
-#define DHTOUTSIDE 4 // D2
-#define DHTTYPE DHT22
-DHT dhtInside(DHTINSIDE, DHTTYPE);
-DHT dhtOutside(DHTOUTSIDE, DHTTYPE);
+#define DHTINSIDE 4 // D2
+#define DHTOUTSIDE 2 // D4
+#define DHTBOX 14 // D5
+// Disse er byttet om pga sensorfeil
+
+// #define DHTTYPE DHT22
+#define DHTTYPE DHTesp::AM2302
+DHTesp dhtInside;
+DHTesp dhtOutside;
+DHTesp dhtBox;
 double temperatureInside =  5.0;
 float humidityInside = 0.0;
 float temperatureOutside = 0.0;
 float humidityOutside = 0.0;
+float temperatureBox = 0.0;
+float humidityBox = 0.0;
 unsigned long dhtReadFailures = 0;
-unsigned long dhtReadInterval = 2000; 
+unsigned long dhtReadInterval = 2500; 
 unsigned long dhtPreviousReadMillis = 0;
 
 // EEPROM Settings
@@ -130,12 +135,11 @@ SmokySettings settings;
 #define HEATERPIN 12 // D6
 #define HEATER_PID_SAMPLE_TIME 1000
 unsigned long pidWindowSize = 5000;
-//unsigned long pidLoopTime = 1000;
 unsigned long maxHeaterOutput = 100;
 bool heaterOn = false;
 unsigned long heaterPreviousCalcMillis = 0;
 unsigned long heaterPreviousPidWindow = 0;
-double heaterOutput =  10.0;
+double heaterOutput = 0.0;
 PID heaterPID(&temperatureInside, &heaterOutput, &(settings.temp), settings.Kp, settings.Ki, settings.Kd, DIRECT);
 
 
@@ -177,22 +181,31 @@ unsigned long loopCount = 0;
 double averageLooptime = 0.0;
 
 
-
 void setup() {
+
+  // delay(1000);
+
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("Starting");
 
   EEPROM.begin(256);
   readSettingsFromEEPROM();
 
   // WiFi
-  delay(10);
+  delay(100);
+  Serial.print("Starting wifi");
   WiFi.begin(wifiSsid, wifiPassword);
   while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
     delay(500);
   }
+  Serial.println("Connected");
 
   // Temperature and humidity
-  dhtInside.begin();
-  dhtOutside.begin();
+  dhtInside.setup(DHTINSIDE, DHTTYPE);
+  dhtOutside.setup(DHTOUTSIDE, DHTTYPE);
+  dhtBox.setup(DHTBOX, DHTTYPE);
   dhtPreviousReadMillis = 0;
   loopReadTempHumid(); // Initial reading to get the temp controller a better start.
 
@@ -213,6 +226,8 @@ void setup() {
   heaterPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
 
   // OTA Update
+  // Can only be done if the file is less than half the memory size
+  // NodeMCU v2 and v3 memory is 4MB
   MDNS.begin("smoky");
   httpUpdater.setup(&httpServer, update_path, update_username, update_password);
   httpServer.begin();
@@ -232,16 +247,17 @@ void setup() {
   pinMode(FAN_CIRC_SENSOR_PIN, INPUT_PULLUP);
 
   writeMqttSettings();
+  Serial.println("Setup done");
 
 }
 
 void readSettingsFromEEPROM(){
   int eeAddress = 0;
-  mqttSend(mqttTopicOutMsg, String("Reading EEPROM").c_str());
+  // mqttSend(mqttTopicOutMsg, String("Reading EEPROM").c_str());
   EEPROM.get(eeAddress, settings);
   
   if(settings.version != SETTINGS_VERSION){
-    mqttSend(mqttTopicOutMsg, String("EEPROM - Not found version").c_str());
+    // mqttSend(mqttTopicOutMsg, String("EEPROM - Not found version").c_str());
     settings.version = SETTINGS_VERSION;
     settings.Kp = DEFAULT_KP;
     settings.Ki = DEFAULT_KI;
@@ -282,7 +298,7 @@ void loop() {
 void calcLoopTime(){
   looptime = millis();
   if(looptime < previousLooptime){
-    // Wrapped arount. Reset time variables.
+    // Wrapped around. Reset time variables.
     resetTimeVariables();
   }
   latestLooptime = looptime - previousLooptime;
@@ -315,16 +331,24 @@ void resetTimeVariables(){
 void loopReadTempHumid(){
   unsigned long currentMillis = millis();
   if (currentMillis - dhtPreviousReadMillis > dhtReadInterval) {
-    double prevTi = temperatureInside;
-    temperatureInside =  dhtInside.readTemperature();
+    temperatureInside =  dhtInside.getTemperature();
+    humidityInside = dhtInside.getHumidity();
+    temperatureOutside = dhtOutside.getTemperature();
+    humidityOutside = dhtOutside.getHumidity();
+    temperatureBox = dhtBox.getTemperature();
+    humidityBox = dhtBox.getHumidity();
     if (isnan(temperatureInside)) {
-      temperatureInside = prevTi;
       dhtReadFailures++;
-      if(PRODUCTION) mqttSend(mqttTopicOutMsg, String("DHT22 Read error").c_str());
+      if(PRODUCTION) mqttSend(mqttTopicOutMsg, String("DHT22 Inside read error").c_str());
     }
-    humidityInside = dhtInside.readHumidity();
-    temperatureOutside = dhtOutside.readTemperature();
-    humidityOutside = dhtOutside.readHumidity();
+    if (isnan(temperatureOutside)) {
+      dhtReadFailures++;
+      if(PRODUCTION) mqttSend(mqttTopicOutMsg, String("DHT22 Outside read error").c_str());
+    }
+    if (isnan(temperatureBox)) {
+      dhtReadFailures++;
+      if(PRODUCTION) mqttSend(mqttTopicOutMsg, String("DHT22 Box read error").c_str());
+    }
     dhtPreviousReadMillis = currentMillis;
   }
 }
@@ -332,6 +356,9 @@ void loopReadTempHumid(){
 void loopControlHeater(){
 
   heaterPID.Compute();
+  if (isnan(temperatureInside) || isnan(heaterOutput)) {
+    heaterOutput = 0.0;
+  }
   
   if (looptime - heaterPreviousPidWindow > pidWindowSize) { //time to shift the Relay Window
     heaterPreviousPidWindow += pidWindowSize;
@@ -414,21 +441,30 @@ void writeMqtt(){
   mqttStatus = MQTT_STATUS_SENDING;
   reconnectMqtt();
 
-  mqttClient.publish(mqttTopicInsideTemperature, String(temperatureInside).c_str());
-  mqttClient.publish(mqttTopicInsideHumidity, String(humidityInside).c_str());
-  mqttClient.publish(mqttTopicOutsideTemperature, String(temperatureOutside).c_str());
-  mqttClient.publish(mqttTopicOutsideHumidity, String(humidityOutside).c_str());
+  if (!isnan(temperatureInside)) {
+    mqttClient.publish(mqttTopicInsideTemperature, String(temperatureInside).c_str());
+    mqttClient.publish(mqttTopicInsideHumidity, String(humidityInside).c_str());
+  }
+  if (!isnan(temperatureOutside)) {
+    mqttClient.publish(mqttTopicOutsideTemperature, String(temperatureOutside).c_str());
+    mqttClient.publish(mqttTopicOutsideHumidity, String(humidityOutside).c_str());
+  }
+  if (!isnan(temperatureBox)) {
+    mqttClient.publish(mqttTopicBoxTemperature, String(temperatureBox).c_str());
+    mqttClient.publish(mqttTopicBoxHumidity, String(humidityBox).c_str());
+  }
+
   mqttClient.publish(mqttTopicSmoke, String(smoke).c_str());
   mqttClient.publish(mqttTopicHeaterOutput, (String(heaterOutput)).c_str());
   mqttClient.publish(mqttTopicDhtReadFailures, (String(dhtReadFailures)).c_str());
-  mqttClient.publish(mqttTopicFanVentSpeed, (String(fanVentSpeedRPM)).c_str());
-  mqttClient.publish(mqttTopicFanCircSpeed, (String(fanCircSpeedRPM)).c_str());
+//  mqttClient.publish(mqttTopicFanVentSpeed, (String(fanVentSpeedRPM)).c_str());
+//  mqttClient.publish(mqttTopicFanCircSpeed, (String(fanCircSpeedRPM)).c_str());
 
-  mqttClient.publish(mqttTopicLooptimeMax, (String(maxLooptime)).c_str());
-  mqttClient.publish(mqttTopicLooptimeMin, (String(minLooptime)).c_str());
-  mqttClient.publish(mqttTopicLooptimeLatest, (String(latestLooptime)).c_str());
-  mqttClient.publish(mqttTopicLooptimeAverage, (String(averageLooptime)).c_str());
-  mqttClient.publish(mqttTopicLooptimeCount, (String(loopCount)).c_str());
+//  mqttClient.publish(mqttTopicLooptimeMax, (String(maxLooptime)).c_str());
+//  mqttClient.publish(mqttTopicLooptimeMin, (String(minLooptime)).c_str());
+//  mqttClient.publish(mqttTopicLooptimeLatest, (String(latestLooptime)).c_str());
+//  mqttClient.publish(mqttTopicLooptimeAverage, (String(averageLooptime)).c_str());
+//  mqttClient.publish(mqttTopicLooptimeCount, (String(loopCount)).c_str());
 
 }
 
@@ -527,4 +563,3 @@ int payloadToInt(byte* payload, unsigned int length, int defaultValue){
   if (f == 0 && payload[0] != '0') return defaultValue;
   else return f;
 }
-
